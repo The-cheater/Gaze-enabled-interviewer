@@ -3,10 +3,11 @@
 import React, { useEffect, useState } from "react";
 import {
     ArrowLeft, CheckCircle2, AlertCircle, ShieldAlert,
-    Play, Volume2, ChevronDown, Activity, Brain, BarChart, Loader2, Eye
+    Play, Volume2, ChevronDown, Activity, Brain, BarChart, Loader2, Eye, RotateCcw
 } from "lucide-react";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
+import ReactMarkdown from "react-markdown";
 import {
     Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer,
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, AreaChart, Area,
@@ -116,6 +117,7 @@ export default function CandidateInsight({ params }: { params: Promise<{ id: str
     const [loading, setLoading]     = useState(true);
     const [activeTab, setActiveTab] = useState("overview");
     const [expandedQ, setExpandedQ] = useState<number | null>(null);
+    const [refreshingRec, setRefreshingRec] = useState(false);
 
     useEffect(() => {
         (async () => {
@@ -129,6 +131,73 @@ export default function CandidateInsight({ params }: { params: Promise<{ id: str
             }
         })();
     }, [id]);
+
+    const handleRefreshRecommendation = async () => {
+        setRefreshingRec(true);
+        console.log("[Examiney][RefreshRec] 🔄 Starting AI recommendation refresh for session:", id);
+        try {
+            // Trigger re-processing
+            console.log("[Examiney][RefreshRec] 📤 Triggering POST /session/{id}/process...");
+            const processRes = await fetch(`${API}/session/${id}/process`, { method: 'POST' });
+            console.log("[Examiney][RefreshRec] 📡 Process response status:", processRes.status);
+            
+            if (!processRes.ok) {
+                const errText = await processRes.text();
+                console.error("[Examiney][RefreshRec] ❌ Failed to start processing:", errText);
+                throw new Error(`Failed to start processing: ${processRes.status}`);
+            }
+            
+            const processData = await processRes.json();
+            console.log("[Examiney][RefreshRec] ✓ Processing started:", processData);
+            
+            // Poll for completion
+            console.log("[Examiney][RefreshRec] ⏳ Polling for completion (max 60 attempts)...");
+            let isReady = false;
+            let attempts = 0;
+            while (!isReady && attempts < 60) {
+                await new Promise(r => setTimeout(r, 1000)); // Wait 1 second
+                const statusRes = await fetch(`${API}/session/${id}/status`);
+                
+                if (statusRes.ok) {
+                    const statusData = await statusRes.json();
+                    console.log(`[Examiney][RefreshRec] Status attempt ${attempts + 1}/60 - Stage: ${statusData.stage} (${statusData.progress}%)`);
+                    
+                    if (statusData.status === 'ready') {
+                        console.log("[Examiney][RefreshRec] ✓ Processing complete! Status:", statusData.status);
+                        isReady = true;
+                    }
+                } else {
+                    console.warn(`[Examiney][RefreshRec] ⚠️ Status check failed with HTTP ${statusRes.status}`);
+                }
+                attempts++;
+            }
+            
+            if (!isReady) {
+                console.warn("[Examiney][RefreshRec] ⚠️ Polling timeout - processing may still be running");
+            }
+            
+            // Refresh the report
+            console.log("[Examiney][RefreshRec] 📥 Fetching updated report...");
+            const reportRes = await fetch(`${API}/session/${id}/report`);
+            if (reportRes.ok) {
+                const updatedReport = await reportRes.json();
+                const newRec = updatedReport.ocean_report?.role_recommendation;
+                console.log("[Examiney][RefreshRec] ✅ Report updated! New recommendation preview:", newRec?.substring(0, 150) + "...");
+                setReport(updatedReport);
+            } else {
+                console.error("[Examiney][RefreshRec] ❌ Failed to fetch updated report:", reportRes.status);
+            }
+        } catch (e) {
+            console.error("[Examiney][RefreshRec] 💥 Error during refresh:", {
+                name: (e as Error).name,
+                message: (e as Error).message,
+                stack: (e as Error).stack,
+            });
+        } finally {
+            setRefreshingRec(false);
+            console.log("[Examiney][RefreshRec] 🏁 Refresh process completed");
+        }
+    };
 
     if (loading) return (
         <div className="flex items-center justify-center h-96 gap-4 text-slate-400">
@@ -419,18 +488,47 @@ export default function CandidateInsight({ params }: { params: Promise<{ id: str
                                 )}
                             </div>
                         ))}
-
-                        {ocean?.role_recommendation && (
-                            <div className="glass-card p-6 rounded-3xl border border-primary/20 bg-primary/5">
-                                <div className="flex items-center gap-2 mb-3">
-                                    <Brain size={16} className="text-primary" />
-                                    <p className="font-ui text-xs text-primary uppercase tracking-widest font-black">AI Recommendation</p>
-                                </div>
-                                <p className="font-body text-slate-300 text-sm leading-relaxed">{ocean.role_recommendation}</p>
-                            </div>
-                        )}
                     </div>
                 </div>
+
+                {/* Full-width AI Recommendation Card */}
+                {ocean?.role_recommendation && (
+                    <div className="glass-card p-8 rounded-3xl border border-primary/20 bg-primary/5">
+                        <div className="flex items-center justify-between mb-6">
+                            <div className="flex items-center gap-3">
+                                <Brain size={20} className="text-primary" />
+                                <p className="font-ui text-sm text-primary uppercase tracking-widest font-black">AI Recommendation</p>
+                            </div>
+                            <button
+                                onClick={handleRefreshRecommendation}
+                                disabled={refreshingRec}
+                                className="p-2 rounded-lg hover:bg-primary/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="Regenerate AI recommendation"
+                            >
+                                <RotateCcw size={18} className={`text-primary ${refreshingRec ? 'animate-spin' : ''}`} />
+                            </button>
+                        </div>
+                        <div className="prose prose-invert max-w-none">
+                            <ReactMarkdown
+                                components={{
+                                    h1: ({ children }) => <h1 className="text-2xl font-black text-slate-100 mt-4 mb-3">{children}</h1>,
+                                    h2: ({ children }) => <h2 className="text-xl font-bold text-slate-100 mt-4 mb-3">{children}</h2>,
+                                    h3: ({ children }) => <h3 className="text-lg font-bold text-slate-200 mt-3 mb-2">{children}</h3>,
+                                    p: ({ children }) => <p className="text-slate-300 text-base leading-relaxed mb-4">{children}</p>,
+                                    ul: ({ children }) => <ul className="list-disc list-inside text-slate-300 text-base space-y-2 mb-4">{children}</ul>,
+                                    ol: ({ children }) => <ol className="list-decimal list-inside text-slate-300 text-base space-y-2 mb-4">{children}</ol>,
+                                    li: ({ children }) => <li className="text-slate-300 text-base">{children}</li>,
+                                    strong: ({ children }) => <strong className="font-black text-slate-100">{children}</strong>,
+                                    em: ({ children }) => <em className="italic text-slate-200">{children}</em>,
+                                    code: ({ children }) => <code className="bg-slate-800 px-2 py-1 rounded text-slate-300 font-mono text-sm">{children}</code>,
+                                    blockquote: ({ children }) => <blockquote className="border-l-4 border-primary/50 pl-4 italic text-slate-400 my-4">{children}</blockquote>,
+                                }}
+                            >
+                                {ocean.role_recommendation}
+                            </ReactMarkdown>
+                        </div>
+                    </div>
+                )}
                 </div>
             )}
 
@@ -579,6 +677,67 @@ export default function CandidateInsight({ params }: { params: Promise<{ id: str
                                                 </span>
                                             </div>
                                         )}
+
+                                        {/* Head pose signals */}
+                                        {(() => {
+                                            const hp = (v.cheat_flags as Record<string,unknown>)?.head_pose as Record<string,unknown> | undefined;
+                                            if (!hp?.head_pose_available) return null;
+                                            const sustained = hp.sustained_head_turn as boolean;
+                                            const offAxis   = hp.predominantly_off_axis as boolean;
+                                            const erratic   = hp.erratic_head_movement as boolean;
+                                            const leftPct   = hp.head_turn_left_pct  as number ?? 0;
+                                            const rightPct  = hp.head_turn_right_pct as number ?? 0;
+                                            const fwdPct    = hp.forward_facing_pct  as number ?? 1;
+                                            const flagged   = sustained || offAxis || erratic;
+                                            return (
+                                                <div className={`mt-2 rounded-xl p-3 border text-xs font-ui
+                                                    ${flagged ? "bg-danger/8 border-danger/20 text-danger" : "bg-slate-800/30 border-white/5 text-slate-400"}`}>
+                                                    <div className="flex items-center gap-2 mb-2">
+                                                        <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0"><circle cx="12" cy="8" r="5"/><path d="M12 13v8"/><path d="M8 17h8"/></svg>
+                                                        <span className="font-black uppercase tracking-widest text-[10px]">Head Pose</span>
+                                                        {flagged && <span className="px-1.5 py-0.5 rounded bg-danger/15 text-danger text-[9px] font-black uppercase tracking-wider">flagged</span>}
+                                                    </div>
+                                                    <div className="grid grid-cols-3 gap-2 mb-2">
+                                                        <div className="bg-slate-900/40 rounded-lg p-2 text-center">
+                                                            <p className="text-[9px] text-slate-500 uppercase tracking-wider mb-0.5">Turn Left</p>
+                                                            <p className={`font-heading text-base font-black ${leftPct > 0.15 ? "text-danger" : "text-slate-300"}`}>{Math.round(leftPct * 100)}%</p>
+                                                        </div>
+                                                        <div className="bg-slate-900/40 rounded-lg p-2 text-center">
+                                                            <p className="text-[9px] text-slate-500 uppercase tracking-wider mb-0.5">Forward</p>
+                                                            <p className={`font-heading text-base font-black ${fwdPct > 0.75 ? "text-success" : "text-warning"}`}>{Math.round(fwdPct * 100)}%</p>
+                                                        </div>
+                                                        <div className="bg-slate-900/40 rounded-lg p-2 text-center">
+                                                            <p className="text-[9px] text-slate-500 uppercase tracking-wider mb-0.5">Turn Right</p>
+                                                            <p className={`font-heading text-base font-black ${rightPct > 0.15 ? "text-danger" : "text-slate-300"}`}>{Math.round(rightPct * 100)}%</p>
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex flex-wrap gap-1.5">
+                                                        {(() => {
+                                                            const absentPct   = hp.face_absent_pct  as number ?? 0;
+                                                            const absentFlag  = hp.face_absent_flagged as boolean;
+                                                            return (
+                                                                <span className={`px-2 py-0.5 rounded-full border text-[9px] font-black uppercase tracking-wider
+                                                                    ${absentFlag ? "bg-danger/10 text-danger border-danger/20" : "bg-slate-800 text-slate-500 border-white/5"}`}>
+                                                                    face absent {Math.round(absentPct * 100)}% {absentFlag ? "✓" : "✗"}
+                                                                </span>
+                                                            );
+                                                        })()}
+                                                        <span className={`px-2 py-0.5 rounded-full border text-[9px] font-black uppercase tracking-wider
+                                                            ${sustained ? "bg-danger/10 text-danger border-danger/20" : "bg-slate-800 text-slate-500 border-white/5"}`}>
+                                                            sustained turn {sustained ? "✓" : "✗"}
+                                                        </span>
+                                                        <span className={`px-2 py-0.5 rounded-full border text-[9px] font-black uppercase tracking-wider
+                                                            ${offAxis ? "bg-danger/10 text-danger border-danger/20" : "bg-slate-800 text-slate-500 border-white/5"}`}>
+                                                            extreme off-axis {offAxis ? "✓" : "✗"}
+                                                        </span>
+                                                        <span className={`px-2 py-0.5 rounded-full border text-[9px] font-black uppercase tracking-wider
+                                                            ${erratic ? "bg-warning/10 text-warning border-warning/20" : "bg-slate-800 text-slate-500 border-white/5"}`}>
+                                                            erratic movement {erratic ? "✓" : "✗"}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
 
                                         {/* Emotion distribution for this question */}
                                         {Object.keys(v.emotion_distribution ?? {}).length > 0 && (

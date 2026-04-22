@@ -1,9 +1,16 @@
+import hashlib
+import logging
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Union
+from typing import Dict, Union
 
 from .models import ParsedResume, Experience, Project
+
+logger = logging.getLogger(__name__)
+
+# Module-level cache for parsed resumes (hash -> ParsedResume)
+_PARSE_CACHE: Dict[str, ParsedResume] = {}
 
 
 @lru_cache(maxsize=1)
@@ -17,11 +24,36 @@ def _get_converter():
 
 
 def parse_pdf(file_path: Union[str, Path]) -> ParsedResume:
-    """Parse a PDF resume using IBM Docling."""
+    """Parse a PDF resume using IBM Docling, with hash-based caching."""
+    try:
+        # Compute hash of file content for caching
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+            file_hash = hashlib.md5(file_content).hexdigest()
+        
+        # Check cache first
+        if file_hash in _PARSE_CACHE:
+            logger.info(f"[Parser] Using cached parse for {file_path} (hash: {file_hash[:8]})")
+            return _PARSE_CACHE[file_hash]
+    except Exception as e:
+        logger.warning(f"[Parser] Cache lookup failed (non-critical): {e}")
+        file_hash = None
+    
+    # Parse using DocumentConverter
     converter = _get_converter()
     result = converter.convert(str(file_path))
     markdown = result.document.export_to_markdown()
-    return _extract_from_markdown(markdown)
+    parsed = _extract_from_markdown(markdown)
+    
+    # Cache the result
+    if file_hash:
+        try:
+            _PARSE_CACHE[file_hash] = parsed
+            logger.info(f"[Parser] Cached parse for {file_path} (hash: {file_hash[:8]})")
+        except Exception as e:
+            logger.warning(f"[Parser] Cache storage failed (non-critical): {e}")
+    
+    return parsed
 
 
 def parse_text(text: str) -> ParsedResume:

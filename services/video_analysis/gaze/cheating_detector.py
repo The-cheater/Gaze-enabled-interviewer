@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -324,4 +324,95 @@ def detect_cheating(
     flags["risk_level"]       = risk_level
     flags["cheat_score"]      = score
     flags["effective_score"]  = round(effective_score, 2)
+    return flags
+
+
+# ── Head pose cheating detector ───────────────────────────────────────────────
+
+def analyze_head_pose(
+    head_pose_samples: List[Dict[str, float]],
+    neurodiversity_adjustment: float = 1.0,
+    face_absent_pct: float = 0.0,
+) -> dict:
+    """
+    Analyse per-frame head pose (yaw / pitch) captured by MediaPipe FaceMesh.
+
+    Works for both sources:
+    - Browser real-time: geometric ratio (nose offset / half face width)
+    - Post-processing:   solvePnP Euler angles normalised by 45 ° → same scale
+
+    ``yaw``   – normalised horizontal rotation. 0 = straight, ±1 ≈ ±45 °.
+    ``pitch`` – normalised vertical rotation.   0 = straight, positive = down.
+    ``face_absent_pct`` – fraction of total tracking frames where NO face was
+                          detected (candidate off-screen or fully turned away).
+
+    Signals (max raw score = 7):
+    A.  Sustained head turn   (left + right > 25 % of frames)     weight=2
+    B.  Predominantly off-axis (|yaw| > 0.40 for > 15 % frames)   weight=2
+    C.  Erratic head movement  (yaw std-dev > 0.15)                weight=1
+    D.  Face absent            (no face in > 20 % of frames)       weight=2  ← real
+    """
+    flags: dict = {
+        "head_pose_available":  len(head_pose_samples) >= 5,
+        "face_absent_pct":      round(float(face_absent_pct), 4),
+        "face_absent_flagged":  face_absent_pct > 0.20,
+    }
+
+    score = 0
+
+    # ── D. Face absent signal (runs even when pose samples are sparse) ────────
+    if face_absent_pct > 0.20:
+        score += 2
+
+    if len(head_pose_samples) < 5:
+        flags.update({
+            "sustained_head_turn":  False,
+            "head_turn_left_pct":   0.0,
+            "head_turn_right_pct":  0.0,
+            "erratic_head_movement": False,
+            "forward_facing_pct":   1.0,
+            "head_pose_score":      score,
+            "head_pose_effective_score": round(score / max(neurodiversity_adjustment, 1.0), 2),
+        })
+        return flags
+
+    yaws = np.array([float(s.get("yaw", 0.0)) for s in head_pose_samples])
+    N    = len(yaws)
+
+    # ── A. Sustained head turn ────────────────────────────────────────────────
+    # 0.25 normalised ≈ ~11° geometric or ~11° solvePnP after /45 normalisation.
+    # A candidate reading notes typically turns 15–30 °.
+    YAW_TURN  = 0.25
+    left_pct  = float(np.mean(yaws >  YAW_TURN))
+    right_pct = float(np.mean(yaws < -YAW_TURN))
+    sustained = (left_pct + right_pct) > 0.25
+    flags["head_turn_left_pct"]  = round(left_pct,  3)
+    flags["head_turn_right_pct"] = round(right_pct, 3)
+    flags["sustained_head_turn"] = sustained
+    if sustained:
+        score += 2
+
+    # ── B. Predominantly off-axis (|yaw| > 0.40 ≈ 18 °) ─────────────────────
+    YAW_EXTREME        = 0.40
+    extreme_pct        = float(np.mean(np.abs(yaws) > YAW_EXTREME))
+    predominantly_off  = extreme_pct > 0.15
+    flags["extreme_head_turn_pct"]  = round(extreme_pct, 3)
+    flags["predominantly_off_axis"] = predominantly_off
+    if predominantly_off:
+        score += 2
+
+    # ── C. Erratic head movement ──────────────────────────────────────────────
+    if N >= 10:
+        yaw_std = float(np.std(yaws))
+        erratic = yaw_std > 0.15
+        flags["erratic_head_movement"] = erratic
+        flags["head_yaw_std"]          = round(yaw_std, 3)
+        if erratic:
+            score += 1
+
+    flags["forward_facing_pct"] = round(float(np.mean(np.abs(yaws) < YAW_TURN)), 3)
+
+    effective = score / max(neurodiversity_adjustment, 1.0)
+    flags["head_pose_score"]           = score
+    flags["head_pose_effective_score"] = round(effective, 2)
     return flags

@@ -494,8 +494,32 @@ def generate_questions(
             key = replacement.question.strip().lower()
         seen_text.add(key)
 
+    # ── CRITICAL FIX: Enforce exact expected question count ──────────────────
+    # Calculate how many questions were expected from batches
+    expected_count = sum(count for _, count in batches)
+    
+    # If we have more questions than expected, trim to exact count
+    if len(all_questions) > expected_count:
+        logger.info(f"[Examiney][Generator] Trimming from {len(all_questions)} to {expected_count} questions (excess removed)")
+        all_questions = all_questions[:expected_count]
+    # If we have fewer questions than expected, pad with fallbacks
+    elif len(all_questions) < expected_count:
+        logger.warning(f"[Examiney][Generator] Padding from {len(all_questions)} to {expected_count} questions (fallbacks added)")
+        while len(all_questions) < expected_count:
+            idx = len(all_questions) + 1
+            # Use the expected stage for this position if possible
+            stage = "intro"
+            for i, (s, c) in enumerate(batches):
+                batch_start = sum(count for _, count in batches[:i])
+                batch_end = batch_start + c
+                if batch_start <= len(all_questions) < batch_end:
+                    stage = s
+                    break
+            fallback_q = _default_question(stage, idx, resume_markdown, job_description)
+            all_questions.append(fallback_q)
+
     total_time = time.time() - start_time
-    logger.info(f"[Examiney][Generator] ✓ DONE! Generated {len(all_questions)} questions in {total_time:.1f}s")
+    logger.info(f"[Examiney][Generator] ✓ DONE! Generated {len(all_questions)} questions in {total_time:.1f}s (expected {expected_count})")
     return InterviewScript(
         job_title=None,
         candidate_name=None,

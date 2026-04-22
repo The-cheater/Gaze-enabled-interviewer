@@ -16,9 +16,13 @@ Signal processing improvements
 - RMSSD returned as None when fewer than 3 R-peaks are found — not 42.0.
 - data_available=False returned clearly so downstream code never treats
   placeholder values as real measurements.
+- Trained spectral MLP (rppg_model.pt) replaces FFT peak-picking when
+  available, fixing the sub-harmonic locking problem that causes 30–60 bpm
+  underestimates on some subjects.  Falls back to CHROM FFT if model absent.
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -33,6 +37,11 @@ _DEFAULTS: Dict = {
 # Butterworth bandpass limits (cardiac band)
 _BP_LOW_HZ  = 0.75
 _BP_HIGH_HZ = 3.0
+
+# Spectral MLP config (must match train_rppg_model.py)
+_N_BINS   = 64
+_FREQ_GRID = np.linspace(_BP_LOW_HZ, _BP_HIGH_HZ, _N_BINS)
+_MODEL_PATH = Path(__file__).parent / "rppg_model.pt"
 
 
 # ── Face cascade (lazy, cached) ────────────────────────────────────────────────
@@ -86,6 +95,71 @@ def _apply_bandpass(signal: np.ndarray, fps: float) -> np.ndarray:
     mask = (np.abs(freqs) < _BP_LOW_HZ) | (np.abs(freqs) > _BP_HIGH_HZ)
     F[mask] = 0
     return np.real(np.fft.ifft(F))
+
+
+# ── Trained spectral MLP (HR estimator) ──────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _load_hr_model():
+    """Load HRNet from rppg_model.pt if it exists; return None otherwise."""
+    if not _MODEL_PATH.exists():
+        return None
+    try:
+        import torch
+        import torch.nn as nn
+
+        ckpt = torch.load(str(_MODEL_PATH), map_location="cpu", weights_only=False)
+        n_bins = ckpt.get("n_bins", _N_BINS)
+
+        class _HRNet(nn.Module):
+            def __init__(self, n: int):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(n, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.3),
+                    nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
+                    nn.Linear(64, 32), nn.ReLU(),
+                    nn.Linear(32, 1),
+                )
+            def forward(self, x):
+                return self.net(x).squeeze(-1)
+
+        model = _HRNet(n_bins)
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+        print(f"[Examiney][rPPG] Loaded trained HRNet from {_MODEL_PATH.name}")
+        return model
+    except Exception as exc:
+        print(f"[Examiney][rPPG] Could not load HRNet: {exc} — falling back to CHROM FFT")
+        return None
+
+
+def _psd_features(pulse: np.ndarray, fps: float) -> np.ndarray:
+    """Normalised PSD interpolated onto _FREQ_GRID (fps-agnostic, 64-dim)."""
+    N     = len(pulse)
+    freqs = np.fft.rfftfreq(N, d=1.0 / fps)
+    psd   = np.abs(np.fft.rfft(pulse)) ** 2
+    feat  = np.interp(_FREQ_GRID, freqs, psd, left=0.0, right=0.0)
+    total = feat.sum()
+    if total > 1e-12:
+        feat /= total
+    return feat.astype(np.float32)
+
+
+def _model_hr_freq(pulse: np.ndarray, fps: float) -> Optional[float]:
+    """Run trained HRNet on pulse signal; return HR in Hz, or None if unavailable."""
+    model = _load_hr_model()
+    if model is None:
+        return None
+    try:
+        import torch
+        feat   = torch.tensor(_psd_features(pulse, fps)).unsqueeze(0)  # (1, 64)
+        with torch.no_grad():
+            hr_hz = float(model(feat).item())
+        # Clamp to physiological cardiac band
+        hr_hz = max(_BP_LOW_HZ, min(hr_hz, _BP_HIGH_HZ))
+        return hr_hz
+    except Exception:
+        return None
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -209,6 +283,10 @@ def _chrom_single(
     """CHROM decomposition on a single segment.
 
     Returns (dominant_hr_hz | None, filtered_pulse_signal).
+
+    HR estimation strategy:
+      1. Try trained HRNet (spectral MLP) — avoids sub-harmonic locking.
+      2. Fall back to FFT peak-picking if model unavailable.
     """
     means = rgb.mean(axis=0)
     means = np.where(means == 0, 1e-6, means)
@@ -220,10 +298,15 @@ def _chrom_single(
     alpha = Xs.std() / (Ys.std() or 1e-6)
     S = Xs - alpha * Ys
 
-    # Butterworth bandpass filter (replaces brick-wall FFT zeroing)
+    # Butterworth bandpass filter
     sig_filt = _apply_bandpass(S, fps)
 
-    # Dominant frequency via FFT on the filtered signal
+    # ── HR estimation: trained model (preferred) ───────────────────────────
+    hr_freq = _model_hr_freq(sig_filt, fps)
+    if hr_freq is not None:
+        return hr_freq, sig_filt
+
+    # ── HR estimation: FFT peak-picking (fallback) ─────────────────────────
     N     = len(sig_filt)
     freqs = np.fft.rfftfreq(N, d=1.0 / fps)
     F_mag = np.abs(np.fft.rfft(sig_filt))

@@ -23,6 +23,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -209,11 +210,12 @@ def _prewarm_deepface() -> None:
     except Exception as e:
         logger.warning(f"[Examiney][Prewarm] DeepFace prewarm skipped: {e}")
 
-# Whisper prewarm runs first through the single-worker executor so any subsequent
-# real transcription calls queue behind it (model already loaded by then).
+# Disabled: Prewarm calls now commented out for lazy loading on first use.
+# Models will load on first request instead of blocking startup.
+# Uncomment to re-enable:
+# _whisper_executor.submit(_prewarm_whisper)
+# threading.Thread(target=_prewarm_deepface, daemon=True).start()
 _print_banner()
-_whisper_executor.submit(_prewarm_whisper)
-threading.Thread(target=_prewarm_deepface, daemon=True).start()
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -745,8 +747,8 @@ async def flag_integrity(session_id: str = Path(...)):
             avg_hrv_rmssd=None,
             stress_spike_detected=True,
             hr_bpm=None,
-            gaze_metrics={"provider": "integrity", "status": "flagged", "risk_level": "high",
-                          "zone_distribution": {}, "cheat_flags": {"risk_level": "high"}},
+            gaze_metrics=_convert_to_serializable({"provider": "integrity", "status": "flagged", "risk_level": "high",
+                          "zone_distribution": {}, "cheat_flags": {"risk_level": "high"}}),
         )
         logger.info(f"[Examiney][Integrity] Session {session_id} flagged as HIGH risk")
     except Exception as e:
@@ -995,7 +997,7 @@ def _bg_process_single_response(
             _step("Running gaze analysis (MediaPipe)")
             metrics = run_gazefollower_on_video(tmp_v, session_id=session_id, calibration_data=cal_data)
             supabase_client.update_video_gaze_metrics(
-                session_id=session_id, question_id=question_id, gaze_metrics=metrics,
+                session_id=session_id, question_id=question_id, gaze_metrics=_convert_to_serializable(metrics),
             )
             risk = metrics.get("cheat_risk_level", "unknown")
             _step("Gaze analysis done", f"status={metrics.get('status')}  cheat_risk={risk}")
@@ -1018,10 +1020,13 @@ def _bg_process_single_response(
 @app.post("/video/analyze-chunk", tags=["Video"],
           summary="Gaze zone classification + DeepFace emotion + rPPG HRV → Supabase")
 async def analyze_video_chunk(
-    session_id:   str                  = Form(...),
-    question_id:  str                  = Form(...),
-    gaze_samples: str                  = Form("[]"),
-    video_file:   Optional[UploadFile] = File(None),
+    session_id:          str                  = Form(...),
+    question_id:         str                  = Form(...),
+    gaze_samples:        str                  = Form("[]"),
+    head_pose_samples:   str                  = Form("[]"),
+    face_absent_frames:  str                  = Form("0"),
+    total_pose_frames:   str                  = Form("0"),
+    video_file:          Optional[UploadFile] = File(None),
 ):
     logger.info(f"[Examiney][VideoChunk] session={session_id} q={question_id}")
     from services.video_analysis.gaze.cheating_detector import detect_cheating
@@ -1081,6 +1086,31 @@ async def analyze_video_chunk(
         logger.warning(f"[Examiney][CheatDetect] {e}")
         cheat_flags = {"risk_level": "low"}
 
+    # Head pose cheating detection — yaw/pitch + face-absence from browser FaceMesh
+    try:
+        from services.video_analysis.gaze.cheating_detector import analyze_head_pose
+        pose_samples: List[Dict] = json.loads(head_pose_samples) if head_pose_samples else []
+        absent_frames  = int(face_absent_frames or 0)
+        total_frames   = int(total_pose_frames  or 0)
+        absent_pct     = absent_frames / max(total_frames, 1) if total_frames > 0 else 0.0
+        if pose_samples or absent_frames > 0:
+            head_pose_result = analyze_head_pose(
+                pose_samples,
+                neurodiversity_adjustment=neuro_adj,
+                face_absent_pct=absent_pct,
+            )
+            cheat_flags["head_pose"] = head_pose_result
+            # Merge head pose effective score into overall risk level
+            hp_eff = head_pose_result.get("head_pose_effective_score", 0.0)
+            gaze_eff = cheat_flags.get("effective_score", 0.0)
+            combined_eff = float(gaze_eff) + float(hp_eff)
+            if combined_eff >= 5:
+                cheat_flags["risk_level"] = "high"
+            elif combined_eff >= 2 and cheat_flags.get("risk_level") != "high":
+                cheat_flags["risk_level"] = "medium"
+    except Exception as e:
+        logger.warning(f"[Examiney][HeadPose] {e}")
+
     # Video analysis (emotion + rPPG)
     emotion_distribution: Dict[str, float] = {"neutral": 1.0}
     avg_hrv_rmssd: Optional[float] = None
@@ -1118,16 +1148,17 @@ async def analyze_video_chunk(
         "baseline_variance": baseline_var,
     }
     try:
+        # Convert all numpy types to Python native types for JSON serialization
         record = supabase_client.save_video_signals(
             session_id=session_id,
             question_id=question_id,
-            gaze_zone_distribution=gaze_zone_distribution,
-            cheat_flags=cheat_flags,
-            emotion_distribution=emotion_distribution,
-            avg_hrv_rmssd=avg_hrv_rmssd,
+            gaze_zone_distribution=_convert_to_serializable(gaze_zone_distribution),
+            cheat_flags=_convert_to_serializable(cheat_flags),
+            emotion_distribution=_convert_to_serializable(emotion_distribution),
+            avg_hrv_rmssd=_convert_to_serializable(avg_hrv_rmssd),
             stress_spike_detected=stress_spike,
-            hr_bpm=hr_bpm,
-            gaze_metrics=gaze_metrics_rt,
+            hr_bpm=_convert_to_serializable(hr_bpm),
+            gaze_metrics=_convert_to_serializable(gaze_metrics_rt),
         )
         return {"status": "saved", "record": record}
     except Exception as e:
@@ -1487,7 +1518,7 @@ async def process_video_session(session_id: str):
             supabase_client.update_video_gaze_metrics(
                 session_id=session_id,
                 question_id=row["question_id"],
-                gaze_metrics=metrics,
+                gaze_metrics=_convert_to_serializable(metrics),
             )
             processed += 1
         except Exception as e:
@@ -1709,107 +1740,157 @@ def _bg_post_session(session_id: str) -> None:
         audio_rows = [r for r in rows if r.get("audio_url") or r.get("video_url")]
         logger.info(f"[Examiney][PostSession] {total_qs} questions, {len(audio_rows)} have audio/video")
 
-        # ── Step 2: transcribe each audio file ─────────────────────────────────
-        done = 0
-        for row in audio_rows:
+        # ── Step 2: transcribe each audio file (parallel download + transcription) ────────────
+        # Pre-transcribe all rows in parallel (max 3 concurrent), then score sequentially
+        def _transcribe_row(row: Dict[str, Any]) -> Dict[str, Any]:
+            """Download and transcribe a single row. Returns result dict."""
+            qid = row.get("question_id", "?")
             aurl = row.get("audio_url") or row.get("video_url")
-            vurl = row.get("video_url")
-            qid  = row.get("question_id", "?")
-            if row.get("transcript", "").strip():
-                logger.debug(f"[Examiney][PostSession] q={qid} already transcribed — skip")
-                done += 1
-                _set_stage(session_id, "transcribing", f"Transcribing audio ({done}/{len(audio_rows)})", done, len(audio_rows))
-                continue
-
-            _set_stage(session_id, "transcribing", f"Transcribing audio ({done + 1}/{len(audio_rows)})…", done, len(audio_rows))
             tmp_path: Optional[str] = None
             try:
-                logger.info(f"[Examiney][PostSession] q={qid} downloading audio…")
+                if row.get("transcript", "").strip():
+                    return {"question_id": qid, "already_transcribed": True}
+                
                 tmp_path = _download_to_tmp(aurl, suffix=".webm")
                 transcript, flagged = _transcribe(tmp_path)
                 logger.info(f"[Examiney][PostSession] q={qid} transcribed: {len(transcript)} chars, flagged={flagged}")
                 if not transcript or flagged:
-                    logger.warning(f"[Examiney][PostSession] q={qid} — Whisper transcription unavailable, scoring based on empty response")
-                supabase_client.update_transcript(
-                    session_id=session_id, question_id=qid,
-                    transcript=transcript, transcript_flagged=flagged,
-                )
-                # Score immediately after transcription
-                _set_stage(session_id, "scoring", f"Scoring response {done + 1}/{len(audio_rows)}", done, len(audio_rows))
-                try:
-                    from services.scoring.llm_marker import judge_response as _judge, mark_response as _mark
-                    ideal    = row.get("ideal_answer", "") or ""
-                    qtxt     = row.get("question_text", "") or ""
-                    q_stage  = stage_map.get(qid, "intro")
-                    
-                    # Score the (possibly empty) transcript
-                    try:
-                        score: ResponseScore = score_response(qid, transcript or "[NO RESPONSE]", ideal, stage=q_stage)
-                    except Exception as score_err:
-                        logger.error(f"[Examiney][PostSession] q={qid} score_response FAILED: {type(score_err).__name__}: {score_err}", exc_info=True)
-                        raise
-                    
-                    # Judge the response
-                    try:
-                        judgment = _judge(question_text=qtxt, ideal_answer=ideal, transcript=transcript or "[NO RESPONSE]", stage=q_stage)
-                    except Exception as judge_err:
-                        logger.error(f"[Examiney][PostSession] q={qid} judge_response FAILED: {type(judge_err).__name__}: {judge_err}", exc_info=True)
-                        judgment = {
-                            "verdict": "not_attempted",
-                            "verdict_reason": "Scoring engine error — transcript unavailable or corrupted",
-                            "key_gaps": ["Unable to evaluate due to system error"],
-                            "strengths": [],
-                            "score": 0.0,
-                        }
-                    
-                    verdict        = judgment.get("verdict", "incomplete")
-                    verdict_reason = judgment.get("verdict_reason", "")
-                    key_gaps       = judgment.get("key_gaps", [])
-                    strengths      = judgment.get("strengths", [])
-                    llm_score      = float(judgment.get("score", score.combined_score or 0.0))
-                    final_score    = round((llm_score * 0.7 + (score.combined_score or 0.0) * 0.3), 2)
-                    
-                    # Dimension scores
-                    marks: Dict[str, Any] = {}
-                    try:
-                        marks = _mark(question_text=qtxt, ideal_answer=ideal, transcript=transcript or "[NO RESPONSE]", stage=q_stage)
-                    except Exception as mark_err:
-                        logger.warning(f"[Examiney][PostSession] q={qid} mark_response failed (non-critical): {mark_err}")
-                    
-                    supabase_client.save_question_response(
-                        session_id=session_id, question_id=qid,
-                        question_text=qtxt, ideal_answer=ideal,
-                        transcript=transcript, transcript_flagged=flagged,
-                        semantic_score=score.semantic_score,
-                        sentiment=score.sentiment.model_dump(),
-                        combined_score=final_score,
-                        technical_score=marks.get("technical"),
-                        communication_score=marks.get("communication"),
-                        behavioral_score=marks.get("behavioral"),
-                        engagement_score=marks.get("engagement"),
-                        authenticity_score=marks.get("authenticity"),
-                        video_url=vurl,
-                        audio_url=aurl,
-                        llm_verdict=verdict,
-                        llm_verdict_reason=verdict_reason,
-                        llm_key_gaps=key_gaps,
-                        llm_strengths=strengths,
-                    )
-                    logger.info(f"[Examiney][PostSession] q={qid} stage={q_stage} verdict={verdict} score={final_score:.2f}")
-                except Exception as se:
-                    logger.error(f"[Examiney][PostSession] q={qid} scoring FAILED: {type(se).__name__}: {se}", exc_info=True)
-                    supabase_client.log_error("PostSessionScore", f"{type(se).__name__}: {str(se)}", session_id)
-                done += 1
+                    logger.warning(f"[Examiney][PostSession] q={qid} — Whisper transcription unavailable")
+                return {
+                    "question_id": qid,
+                    "already_transcribed": False,
+                    "transcript": transcript,
+                    "flagged": flagged,
+                }
             except Exception as e:
                 logger.error(f"[Examiney][PostSession] q={qid} transcription FAILED: {e}")
                 supabase_client.log_error("PostSessionTranscribe", str(e), session_id)
-                done += 1
+                return {
+                    "question_id": qid,
+                    "already_transcribed": False,
+                    "transcript": "",
+                    "flagged": True,
+                    "error": str(e),
+                }
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     try:
                         os.unlink(tmp_path)
                     except Exception:
                         pass
+        
+        # Run transcriptions in parallel (max 3 concurrent)
+        transcribe_results: Dict[str, Dict[str, Any]] = {}
+        rows_to_transcribe = [r for r in audio_rows if not r.get("transcript", "").strip()]
+        rows_already_done = [r for r in audio_rows if r.get("transcript", "").strip()]
+        
+        if rows_to_transcribe:
+            with ThreadPoolExecutor(max_workers=min(3, len(rows_to_transcribe))) as executor:
+                futures = {executor.submit(_transcribe_row, row): row["question_id"] for row in rows_to_transcribe}
+                done = len(rows_already_done)
+                for future in as_completed(futures):
+                    result = future.result()
+                    transcribe_results[result["question_id"]] = result
+                    done += 1
+                    _set_stage(session_id, "transcribing", f"Transcribing audio ({done}/{len(audio_rows)})", done, len(audio_rows))
+        
+        # Mark already-transcribed rows as done
+        done = len(rows_already_done)
+        for row in rows_already_done:
+            qid = row.get("question_id", "?")
+            logger.debug(f"[Examiney][PostSession] q={qid} already transcribed — skip")
+            transcribe_results[qid] = {"question_id": qid, "already_transcribed": True}
+            done += 1
+            _set_stage(session_id, "transcribing", f"Transcribing audio ({done}/{len(audio_rows)})", done, len(audio_rows))
+        
+        # ── Step 2b: Score all transcribed responses (sequential, same as before) ────────────
+        done = 0
+        for row in audio_rows:
+            aurl = row.get("audio_url") or row.get("video_url")
+            vurl = row.get("video_url")
+            qid  = row.get("question_id", "?")
+            
+            # Get transcription result
+            trans_result = transcribe_results.get(qid, {})
+            if trans_result.get("already_transcribed"):
+                done += 1
+                continue
+            
+            transcript = trans_result.get("transcript", "")
+            flagged = trans_result.get("flagged", True)
+            
+            # Update transcript in database
+            supabase_client.update_transcript(
+                session_id=session_id, question_id=qid,
+                transcript=transcript, transcript_flagged=flagged,
+            )
+            
+            # Score immediately after transcription
+            _set_stage(session_id, "scoring", f"Scoring response {done + 1}/{len(audio_rows)}", done, len(audio_rows))
+            try:
+                from services.scoring.llm_marker import judge_response as _judge, mark_response as _mark
+                ideal    = row.get("ideal_answer", "") or ""
+                qtxt     = row.get("question_text", "") or ""
+                q_stage  = stage_map.get(qid, "intro")
+                
+                # Score the (possibly empty) transcript
+                try:
+                    score: ResponseScore = score_response(qid, transcript or "[NO RESPONSE]", ideal, stage=q_stage)
+                except Exception as score_err:
+                    logger.error(f"[Examiney][PostSession] q={qid} score_response FAILED: {type(score_err).__name__}: {score_err}", exc_info=True)
+                    raise
+                
+                # Judge the response
+                try:
+                    judgment = _judge(question_text=qtxt, ideal_answer=ideal, transcript=transcript or "[NO RESPONSE]", stage=q_stage)
+                except Exception as judge_err:
+                    logger.error(f"[Examiney][PostSession] q={qid} judge_response FAILED: {type(judge_err).__name__}: {judge_err}", exc_info=True)
+                    judgment = {
+                        "verdict": "not_attempted",
+                        "verdict_reason": "Scoring engine error — transcript unavailable or corrupted",
+                        "key_gaps": ["Unable to evaluate due to system error"],
+                        "strengths": [],
+                        "score": 0.0,
+                    }
+                
+                verdict        = judgment.get("verdict", "incomplete")
+                verdict_reason = judgment.get("verdict_reason", "")
+                key_gaps       = judgment.get("key_gaps", [])
+                strengths      = judgment.get("strengths", [])
+                llm_score      = float(judgment.get("score", score.combined_score or 0.0))
+                final_score    = round((llm_score * 0.7 + (score.combined_score or 0.0) * 0.3), 2)
+                
+                # Dimension scores
+                marks: Dict[str, Any] = {}
+                try:
+                    marks = _mark(question_text=qtxt, ideal_answer=ideal, transcript=transcript or "[NO RESPONSE]", stage=q_stage)
+                except Exception as mark_err:
+                    logger.warning(f"[Examiney][PostSession] q={qid} mark_response failed (non-critical): {mark_err}")
+                
+                supabase_client.save_question_response(
+                    session_id=session_id, question_id=qid,
+                    question_text=qtxt, ideal_answer=ideal,
+                    transcript=transcript, transcript_flagged=flagged,
+                    semantic_score=score.semantic_score,
+                    sentiment=score.sentiment.model_dump(),
+                    combined_score=final_score,
+                    technical_score=marks.get("technical"),
+                    communication_score=marks.get("communication"),
+                    behavioral_score=marks.get("behavioral"),
+                    engagement_score=marks.get("engagement"),
+                    authenticity_score=marks.get("authenticity"),
+                    video_url=vurl,
+                    audio_url=aurl,
+                    llm_verdict=verdict,
+                    llm_verdict_reason=verdict_reason,
+                    llm_key_gaps=key_gaps,
+                    llm_strengths=strengths,
+                )
+                logger.info(f"[Examiney][PostSession] q={qid} stage={q_stage} verdict={verdict} score={final_score:.2f}")
+            except Exception as se:
+                logger.error(f"[Examiney][PostSession] q={qid} scoring FAILED: {type(se).__name__}: {se}", exc_info=True)
+                supabase_client.log_error("PostSessionScore", f"{type(se).__name__}: {str(se)}", session_id)
+            done += 1
 
         # ── Step 3: finalize OCEAN (inline — no self-HTTP call) ───────────────
         _set_stage(session_id, "finalizing", "Computing OCEAN personality profile…", total_qs, total_qs)
@@ -1833,7 +1914,7 @@ def _bg_post_session(session_id: str) -> None:
             # Fetch existing video_signals state for this session
             vs_rows = (
                 c.table("video_signals")
-                .select("question_id,gaze_metrics,emotion_distribution,avg_hrv_rmssd")
+                .select("question_id,gaze_metrics,emotion_distribution,avg_hrv_rmssd,cheat_flags")
                 .eq("session_id", session_id)
                 .execute()
             ).data or []
@@ -1864,8 +1945,12 @@ def _bg_post_session(session_id: str) -> None:
                 existing_emotion = existing.get("emotion_distribution") or {}
                 emotion_ok = isinstance(existing_emotion, dict) and len(existing_emotion) > 1
                 rppg_ok    = existing.get("avg_hrv_rmssd") is not None
+                # head_pose_ok: cheat_flags already contains a head_pose sub-dict
+                existing_cf = existing.get("cheat_flags") or {}
+                head_pose_ok = isinstance(existing_cf.get("head_pose"), dict) and \
+                               existing_cf["head_pose"].get("head_pose_available") is True
 
-                if gaze_ok and emotion_ok and rppg_ok:
+                if gaze_ok and emotion_ok and rppg_ok and head_pose_ok:
                     logger.debug(f"[Examiney][PostSession] all signals done q={qid} — skip")
                     return
 
@@ -1883,7 +1968,7 @@ def _bg_post_session(session_id: str) -> None:
                             for attempt in range(max_gaze_retries):
                                 try:
                                     supabase_client.update_video_gaze_metrics(
-                                        session_id=session_id, question_id=qid, gaze_metrics=metrics,
+                                        session_id=session_id, question_id=qid, gaze_metrics=_convert_to_serializable(metrics),
                                     )
                                     logger.info(f"[Examiney][PostSession] gaze q={qid}: status={metrics.get('status')}")
                                     break  # Success
@@ -1897,22 +1982,82 @@ def _bg_post_session(session_id: str) -> None:
                             logger.error(f"[Examiney][PostSession] gaze FAILED q={qid}: {type(eg).__name__}: {eg}")
                             supabase_client.log_error("PostSessionGaze", str(eg), session_id)
 
-                    # ── Emotion + rPPG ────────────────────────────────────────
+                    # ── Emotion + rPPG + Head pose (parallel analysis) ───────────────────
+                    # Run all three analyses in parallel for better performance
                     update_payload: Dict[str, Any] = {}
-                    if not emotion_ok:
-                        try:
-                            update_payload["emotion_distribution"] = analyze_emotions_from_video(tmp_v)
-                        except Exception as ee:
-                            logger.error(f"[Examiney][PostSession] emotion FAILED q={qid}: {ee}")
-                    if not rppg_ok:
-                        try:
-                            rppg_result = analyze_rppg_from_video(tmp_v)
-                            if rppg_result.get("data_available"):
-                                update_payload["avg_hrv_rmssd"]        = rppg_result.get("avg_hrv_rmssd")
-                                update_payload["hr_bpm"]               = rppg_result.get("hr_bpm")
-                                update_payload["stress_spike_detected"] = rppg_result.get("stress_spike_detected", False)
-                        except Exception as er:
-                            logger.error(f"[Examiney][PostSession] rPPG FAILED q={qid}: {er}")
+                    analysis_futures = {}
+                    
+                    with ThreadPoolExecutor(max_workers=3) as analysis_pool:
+                        # Submit emotion analysis
+                        if not emotion_ok:
+                            analysis_futures['emotion'] = analysis_pool.submit(lambda: analyze_emotions_from_video(tmp_v))
+                        
+                        # Submit rPPG analysis
+                        if not rppg_ok:
+                            analysis_futures['rppg'] = analysis_pool.submit(lambda: analyze_rppg_from_video(tmp_v))
+                        
+                        # Submit head pose analysis
+                        if not head_pose_ok:
+                            def _extract_and_analyze_pose():
+                                from services.video_analysis.gaze.head_pose_runner import extract_head_pose_from_video
+                                from services.video_analysis.gaze.cheating_detector import analyze_head_pose
+                                pose_data = extract_head_pose_from_video(tmp_v)
+                                pose_samples_pp  = pose_data.get("samples", [])
+                                absent_pct_pp    = float(pose_data.get("face_absent_pct", 0.0))
+                                neuro_adj_pp = cal_data.get("neurodiversity_adjustment", 1.0)
+                                hp_result = analyze_head_pose(
+                                    pose_samples_pp,
+                                    neurodiversity_adjustment=neuro_adj_pp,
+                                    face_absent_pct=absent_pct_pp,
+                                )
+                                return {"data": hp_result, "pose_data": pose_data}
+                            
+                            analysis_futures['head_pose'] = analysis_pool.submit(_extract_and_analyze_pose)
+                        
+                        # Collect results
+                        if 'emotion' in analysis_futures:
+                            try:
+                                update_payload["emotion_distribution"] = analysis_futures['emotion'].result()
+                            except Exception as ee:
+                                logger.error(f"[Examiney][PostSession] emotion FAILED q={qid}: {ee}")
+                        
+                        if 'rppg' in analysis_futures:
+                            try:
+                                rppg_result = analysis_futures['rppg'].result()
+                                if rppg_result.get("data_available"):
+                                    update_payload["avg_hrv_rmssd"]        = rppg_result.get("avg_hrv_rmssd")
+                                    update_payload["hr_bpm"]               = rppg_result.get("hr_bpm")
+                                    update_payload["stress_spike_detected"] = rppg_result.get("stress_spike_detected", False)
+                            except Exception as er:
+                                logger.error(f"[Examiney][PostSession] rPPG FAILED q={qid}: {er}")
+                        
+                        if 'head_pose' in analysis_futures:
+                            try:
+                                hp_result_data = analysis_futures['head_pose'].result()
+                                hp_result = hp_result_data.get("data", {})
+                                pose_data = hp_result_data.get("pose_data", {})
+                                absent_pct_pp = float(pose_data.get("face_absent_pct", 0.0))
+                                
+                                if hp_result:
+                                    merged_cf = dict(existing_cf)
+                                    merged_cf["head_pose"] = hp_result
+                                    gaze_eff = float(merged_cf.get("effective_score", 0))
+                                    hp_eff   = float(hp_result.get("head_pose_effective_score", 0))
+                                    combined_eff = gaze_eff + hp_eff
+                                    if combined_eff >= 5:
+                                        merged_cf["risk_level"] = "high"
+                                    elif combined_eff >= 2 and merged_cf.get("risk_level") != "high":
+                                        merged_cf["risk_level"] = "medium"
+                                    update_payload["cheat_flags"] = merged_cf
+                                    logger.info(
+                                        f"[Examiney][PostSession] head_pose q={qid}: "
+                                        f"sustained={hp_result.get('sustained_head_turn')} "
+                                        f"absent={absent_pct_pp:.1%} "
+                                        f"score={hp_result.get('head_pose_score')} "
+                                        f"risk={merged_cf.get('risk_level')}"
+                                    )
+                            except Exception as ehp:
+                                logger.error(f"[Examiney][PostSession] head_pose FAILED q={qid}: {ehp}")
 
                     if update_payload:
                         try:
@@ -1978,6 +2123,25 @@ def _bg_post_session(session_id: str) -> None:
 
         except Exception as e:
             logger.error(f"[Examiney][PostSession] video signals catch-up FAILED: {e}")
+
+        # ── Final stage: Dummy processing (1 minute) to appear seamless ─────────────
+        # All real work is done; this just provides a final "Processing..." state
+        # so the candidate doesn't see "complete" too quickly and wonder if something is wrong
+        logger.info(f"[Examiney][PostSession] Starting 1-minute finalization stage for seamless UX")
+        _set_stage(session_id, "finalizing", "Finalizing results…", 0, 1)
+        import time
+        start_finalize = time.time()
+        finalize_duration = 60  # 1 minute
+        while (time.time() - start_finalize) < finalize_duration:
+            elapsed = time.time() - start_finalize
+            progress = int((elapsed / finalize_duration) * 100)
+            _set_stage(
+                session_id, "finalizing",
+                f"Finalizing results… {progress}%",
+                min(progress, 100), 100
+            )
+            time.sleep(2)  # Update every 2 seconds
+        logger.info(f"[Examiney][PostSession] Finalization complete")
 
     finally:
         _clear_stage(session_id)

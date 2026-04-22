@@ -17,6 +17,7 @@ interface Question {
     ideal_answer: string; time_window_seconds: number;
 }
 interface GazeSample { x: number; y: number }
+interface HeadPoseSample { yaw: number; pitch: number }
 declare global { interface Window { FaceMesh: unknown } }
 
 function Toast({ msg }: { msg: string }) {
@@ -56,9 +57,12 @@ export default function InterviewPage() {
     const waveFrameRef     = useRef<number>(0);
     const gazeVideoRef     = useRef<HTMLVideoElement>(null);
     const gazeCanvasRef    = useRef<HTMLCanvasElement>(null);
-    const faceMeshRef      = useRef<unknown>(null);
-    const gazeSamplesRef   = useRef<GazeSample[]>([]);
-    const gazeRafRef       = useRef<number>(0);
+    const faceMeshRef         = useRef<unknown>(null);
+    const gazeSamplesRef      = useRef<GazeSample[]>([]);
+    const headPoseSamplesRef  = useRef<HeadPoseSample[]>([]);
+    const faceAbsentFramesRef = useRef<number>(0);   // frames where no face detected
+    const totalPoseFramesRef  = useRef<number>(0);   // total FaceMesh frames attempted
+    const gazeRafRef          = useRef<number>(0);
     const heartbeatRef     = useRef<ReturnType<typeof setInterval> | null>(null);
 
     const showToast = useCallback((msg: string) => {
@@ -148,10 +152,42 @@ export default function InterviewPage() {
         fm.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.3, minTrackingConfidence: 0.3 });
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         fm.onResults((res: any) => {
+            totalPoseFramesRef.current += 1;
             const lms = res?.multiFaceLandmarks?.[0];
-            if (lms?.length > 473) {
-                const l = lms[468], r = lms[473];
-                gazeSamplesRef.current.push({ x: (l.x + r.x) / 2, y: (l.y + r.y) / 2 });
+
+            if (!lms || lms.length <= 473) {
+                // No face detected in this frame — candidate off-screen or fully turned away
+                faceAbsentFramesRef.current += 1;
+                return;
+            }
+
+            // Iris gaze sample (landmarks 468 = left iris, 473 = right iris)
+            const l = lms[468], r = lms[473];
+            gazeSamplesRef.current.push({ x: (l.x + r.x) / 2, y: (l.y + r.y) / 2 });
+
+            // Head pose estimation from stable facial landmarks:
+            //   1   = nose tip,  234 = left temple,  454 = right temple
+            //   10  = forehead centre,  152 = chin centre
+            if (lms.length > 454) {
+                const noseTip   = lms[1];
+                const leftEdge  = lms[234];
+                const rightEdge = lms[454];
+                const forehead  = lms[10];
+                const chin      = lms[152];
+
+                const faceW = rightEdge.x - leftEdge.x;
+                const faceH = chin.y - forehead.y;
+                const midX  = (leftEdge.x + rightEdge.x) / 2;
+                const midY  = (forehead.y + chin.y) / 2;
+
+                // Normalised yaw/pitch: 0 = straight, ±1 ≈ ±45° (matches solvePnP scale)
+                const yaw   = faceW > 0.01 ? (noseTip.x - midX) / (faceW * 0.5) : 0;
+                const pitch = faceH > 0.01 ? (noseTip.y - midY) / (faceH * 0.5) : 0;
+
+                headPoseSamplesRef.current.push({
+                    yaw:   Math.round(yaw   * 1000) / 1000,
+                    pitch: Math.round(pitch * 1000) / 1000,
+                });
             }
         });
         faceMeshRef.current = fm;
@@ -274,8 +310,14 @@ export default function InterviewPage() {
         try {
             const q                  = questions[currentQ];
             const { video, audio }   = await stopRecording();
-            const gazeCopy = [...gazeSamplesRef.current];
+            const gazeCopy     = [...gazeSamplesRef.current];
             gazeSamplesRef.current = [];
+            const headPoseCopy = [...headPoseSamplesRef.current];
+            headPoseSamplesRef.current = [];
+            const faceAbsentFrames = faceAbsentFramesRef.current;
+            const totalPoseFrames  = totalPoseFramesRef.current;
+            faceAbsentFramesRef.current = 0;
+            totalPoseFramesRef.current  = 0;
 
             const qNum  = currentQ + 1;
             const fname = `question${qNum}_video.webm`;
@@ -293,7 +335,10 @@ export default function InterviewPage() {
             const gazeFd = new FormData();
             gazeFd.append("session_id",   sessionId);
             gazeFd.append("question_id",  q.id);
-            gazeFd.append("gaze_samples", JSON.stringify(gazeCopy));
+            gazeFd.append("gaze_samples",        JSON.stringify(gazeCopy));
+            gazeFd.append("head_pose_samples",   JSON.stringify(headPoseCopy));
+            gazeFd.append("face_absent_frames",  String(faceAbsentFrames));
+            gazeFd.append("total_pose_frames",   String(totalPoseFrames));
             if (video.size > 0) gazeFd.append("video_file", video, fname);
 
             const isLast = currentQ >= questions.length - 1;

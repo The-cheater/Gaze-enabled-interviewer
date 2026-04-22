@@ -24,7 +24,7 @@ import numpy as np
 from services.question_gen.models import InterviewScript
 from services.scoring.models import CareerMatch, OceanReport, OceanScores, ResponseScore, TraitSignals
 
-_PERSONALITY_CSV = Path(__file__).resolve().parents[2] / "personality.csv"
+_PERSONALITY_CSV = Path(__file__).resolve().parents[2] / "data" / "personality.csv"
 
 # ── Company-relevant signal keyword banks ────────────────────────────────────
 
@@ -562,13 +562,26 @@ def _get_role_recommendation(
 ) -> str:
     from services.question_gen.models import InterviewScript as _IS  # local to avoid circular
 
+    # Log incoming context for recommendation generation
+    ocean_summary = f"O={ocean.openness:.0f}, C={ocean.conscientiousness:.0f}, E={ocean.extraversion:.0f}, A={ocean.agreeableness:.0f}, N={ocean.neuroticism:.0f}"
+    logger.info(f"[Examiney][RoleRec] Starting recommendation: fit_score={job_fit_score:.1f}, confidence={confidence}, OCEAN={ocean_summary}, job_desc_len={len(job_description) if job_description else 0}")
+
     jd_snippet = job_description[:400] if job_description else "Not provided."
     confidence_note = "" if confidence == "High" else f" (confidence is {confidence} — limited response data)"
 
-    # Build Q&A summary for the prompt
+    # Build detailed Q&A summary with job mapping
     qa_lines: List[str] = []
+    weightage_breakdown: List[str] = []
+    
     if scores and script:
         q_map = {q.id: q for q in script.questions}
+        
+        # Categorize questions by stage and extract relevant ones for job role mapping
+        technical_qa = []
+        behavioral_qa = []
+        logical_qa = []
+        situational_qa = []
+        
         for s in scores:
             q_obj = q_map.get(s.question_id)
             if not q_obj:
@@ -576,24 +589,66 @@ def _get_role_recommendation(
             transcript = s.transcript.strip()
             if not transcript or transcript.upper().startswith(("[NO RESPONSE", "[NO AUDIO")):
                 continue
+            
             score_10 = round(s.combined_score, 1)
-            # Truncate long transcripts to keep prompt manageable
             answer_snippet = transcript[:300] + ("…" if len(transcript) > 300 else "")
-            qa_lines.append(
+            
+            qa_line = (
                 f"  Q ({q_obj.stage}): {q_obj.question}\n"
                 f"  Answer: {answer_snippet}\n"
                 f"  Score: {score_10}/10"
             )
+            qa_lines.append(qa_line)
+            
+            # Map to job role stage weights
+            stage_weight = 1.0
+            stage_relevance = "foundational"
+            if q_obj.stage == "technical":
+                stage_weight = 3.0
+                stage_relevance = "highly relevant"
+                technical_qa.append(score_10)
+            elif q_obj.stage == "logical":
+                stage_weight = 2.5
+                stage_relevance = "critical for role"
+                logical_qa.append(score_10)
+            elif q_obj.stage == "behavioral":
+                stage_weight = 2.0
+                stage_relevance = "important for fit"
+                behavioral_qa.append(score_10)
+            elif q_obj.stage == "situational":
+                stage_weight = 2.0
+                stage_relevance = "important for fit"
+                situational_qa.append(score_10)
+            
+            weighted_score = score_10 * stage_weight
+            weightage_breakdown.append(
+                f"  • {q_obj.stage.title()} Q: {score_10:.1f}/10 × {stage_weight} weight = {weighted_score:.1f} ({stage_relevance})"
+            )
 
     qa_block = "\n\n".join(qa_lines) if qa_lines else "No interview responses recorded."
+    weightage_block = "\n".join(weightage_breakdown) if weightage_breakdown else "No question responses."
+
+    # Calculate weighted average per stage
+    stage_averages = {}
+    if technical_qa:
+        stage_averages["Technical"] = sum(technical_qa) / len(technical_qa)
+    if logical_qa:
+        stage_averages["Logical Reasoning"] = sum(logical_qa) / len(logical_qa)
+    if behavioral_qa:
+        stage_averages["Behavioral Fit"] = sum(behavioral_qa) / len(behavioral_qa)
+    if situational_qa:
+        stage_averages["Situational Judgment"] = sum(situational_qa) / len(situational_qa)
 
     # Determine fit verdict label
     if job_fit_score >= 70:
         fit_verdict = "Recommended"
+        fit_reason = "Strong alignment with role requirements"
     elif job_fit_score >= 50:
         fit_verdict = "Recommended with caution"
+        fit_reason = "Adequate alignment; some areas need development"
     else:
         fit_verdict = "Not recommended"
+        fit_reason = "Insufficient alignment with role requirements"
 
     # Strongest / weakest OCEAN trait
     ocean_dict = {
@@ -606,56 +661,78 @@ def _get_role_recommendation(
     strongest_trait = max(ocean_dict, key=ocean_dict.__getitem__)
     weakest_trait = min(ocean_dict, key=ocean_dict.__getitem__)
 
-    prompt = (
-        f"You are a senior talent assessor writing a structured candidate evaluation report.\n\n"
-        f"=== INTERVIEW Q&A DATA ===\n{qa_block}\n\n"
-        f"=== CONTEXT ===\n"
-        f"Role: {jd_snippet}\n"
-        f"Job Fit Score: {job_fit_score:.1f}/100 ({confidence_note})\n"
-        f"Verdict: {fit_verdict}\n"
-        f"OCEAN scores (0-100): Openness={ocean.openness:.1f}, Conscientiousness={ocean.conscientiousness:.1f}, "
-        f"Extraversion={ocean.extraversion:.1f}, Agreeableness={ocean.agreeableness:.1f}, Neuroticism={ocean.neuroticism:.1f}\n"
-        f"Strongest trait: {strongest_trait} ({ocean_dict[strongest_trait]:.1f})\n"
-        f"Weakest trait: {weakest_trait} ({ocean_dict[weakest_trait]:.1f})\n\n"
-        "=== OUTPUT FORMAT ===\n"
-        "Write a bullet-point evaluation EXACTLY in this order:\n\n"
-        "**Answer Quality Assessment:**\n"
-        "For EACH question above, output one bullet:\n"
-        "• [Question topic] — [Was the answer technically correct / relevant? Rate quality: Poor/Adequate/Good/Excellent (X/10)] — [1-sentence insight on what was right or missing]\n\n"
-        "**Personality & Fit Analysis:**\n"
-        f"• Strongest trait ({strongest_trait}): [how this helps performance in this role]\n"
-        f"• Weakest trait ({weakest_trait}): [how this may hinder performance or what to watch for]\n"
-        f"• Job Fit Score ({job_fit_score:.1f}/100): {fit_verdict} — [one sentence reason based on interview performance]\n\n"
-        "RULES: Never contradict the verdict label. Be specific and factual. Output plain bullets only — no JSON, no extra headers."
-    )
-    system_msg = (
-        "You are a senior talent assessment AI. Follow the OUTPUT FORMAT exactly. "
-        "Use bullet points as instructed. Be concise and factual."
-    )
+    # Build stage performance summary
+    stage_summary = ""
+    for stage, avg in stage_averages.items():
+        level = "Excellent" if avg >= 8 else "Good" if avg >= 6 else "Adequate" if avg >= 4 else "Needs Improvement"
+        stage_summary += f"  • {stage}: {avg:.1f}/10 ({level})\n"
 
-    # Try Gemini (key1 → key2, model fallback chain)
+    # ── SIMPLIFIED, ROBUST PROMPT (avoid LLM confusion from complex templates) ──
+    prompt = (
+        f"You are evaluating a candidate for this position: {jd_snippet}\n\n"
+        f"CANDIDATE INTERVIEW DATA:\n"
+        f"{qa_block}\n\n"
+        f"PERFORMANCE BY STAGE:\n{stage_summary or 'No data'}\n\n"
+        f"JOB FIT METRICS:\n"
+        f"• Overall Fit Score: {job_fit_score:.1f}/100\n"
+        f"• Assessment: {fit_verdict} ({fit_reason})\n\n"
+        f"PERSONALITY PROFILE (Big Five OCEAN):\n"
+        f"• Primary Strength: {strongest_trait} ({ocean_dict[strongest_trait]:.0f}/100)\n"
+        f"• Development Area: {weakest_trait} ({ocean_dict[weakest_trait]:.0f}/100)\n\n"
+        f"TASK: Write a professional 3-paragraph assessment for the hiring team using this MARKDOWN format:\n\n"
+        f"**Job Fit Assessment**\n\n"
+        f"[First paragraph: Assess how well their interview responses align with the role requirements (job fit)]\n\n"
+        f"**Personality & Development**\n\n"
+        f"[Second paragraph: Analyze their professional strengths and areas for development based on personality traits]\n\n"
+        f"**Hiring Recommendation**\n\n"
+        f"[Third paragraph: Provide a clear hiring recommendation]\n\n"
+        f"STRICTLY: Use the markdown headers exactly as shown. Be direct, data-driven, and specific to their answers."
+    )
+    system_msg = "You are a professional talent assessor writing objective, data-driven evaluations for hiring decisions. Format your response in markdown with **bold** section headers. Write concisely and avoid generic statements — base all claims on the specific interview data provided."
+
+
+    # ── PRIORITY 1: Try Gemini (primary LLM providers) ────────────────────────
+    logger.info(f"[Examiney][RoleRec] Starting role recommendation generation (fit_score={job_fit_score:.1f}, ocean={strongest_trait})")
     keys = [k for k in (GEMINI_API_KEY, GEMINI_API_KEY2) if k]
     models = [GEMINI_MODEL] + [m for m in _GEMINI_FALLBACKS if m != GEMINI_MODEL]
+    logger.info(f"[Examiney][RoleRec] Gemini available: {len(keys)} API key(s), {len(models)} model(s)")
     gemini_payload = {
         "system_instruction": {"parts": [{"text": system_msg}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1024},
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048},
     }
     for _key in keys:
         for _model in models:
             _url = f"{_GEMINI_BASE}/{_model}:generateContent"
+            logger.debug(f"[Examiney][RoleRec] Trying Gemini {_model} with API key (last 4: ...{_key[-4:]})")
             try:
                 with httpx.Client(timeout=20.0) as client:
                     r = client.post(_url, params={"key": _key}, json=gemini_payload)
                     if r.status_code in (400, 404, 429):
+                        logger.debug(f"[Examiney][RoleRec] Gemini {_model} returned {r.status_code}, trying next…")
                         continue
                     r.raise_for_status()
                     result = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    # Validate: should not be echoing format instructions or be too short
+                    if not result:
+                        logger.warning(f"[Examiney][RoleRec] Gemini {_model}: Empty response")
+                        continue
+                    if len(result) <= 100:
+                        logger.warning(f"[Examiney][RoleRec] Gemini {_model}: Response too short ({len(result)} chars)")
+                        continue
+                    if result.startswith(("Answer Quality Assessment", "===", "1. Job Fit", "**1.", "- Job Fit")):
+                        logger.warning(f"[Examiney][RoleRec] Gemini {_model}: Response echoes template format. First 100 chars: {result[:100]}")
+                        continue
+                    logger.info(f"[Examiney][RoleRec] ✓ Gemini {_model} succeeded ({len(result)} chars)")
                     return _clean_text_markdown(result)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[Examiney][RoleRec] Gemini {_model} error: {type(e).__name__}: {str(e)[:100]}")
                 continue
 
-    # Try Ollama /api/chat
+    # ── PRIORITY 2: Try Ollama (primary fallback — must work before static response) ────────────
+    logger.info(f"[Examiney][RoleRec] Gemini attempts exhausted. Attempting Ollama fallback (url={ollama_url})…")
+    
+    # Try Ollama /api/chat (most compatible endpoint)
     chat_payload = {
         "model": model,
         "messages": [
@@ -663,59 +740,108 @@ def _get_role_recommendation(
             {"role": "user",   "content": prompt},
         ],
         "stream": False,
-        "options": {"temperature": 0.4, "num_predict": 1024},
+        "options": {"temperature": 0.4, "num_predict": 2048},
     }
     try:
+        logger.debug(f"[Examiney][RoleRec] Trying Ollama /api/chat at {ollama_url} with model={model}")
         with httpx.Client(timeout=60.0) as client:
             resp = client.post(f"{ollama_url}/api/chat", json=chat_payload)
             if resp.status_code == 200:
                 result = resp.json()["message"]["content"].strip()
-                return _clean_text_markdown(result)
-            raise RuntimeError(f"HTTP {resp.status_code}")
-    except Exception:
-        pass
+                # Validate response is meaningful and not echoing template
+                if not result:
+                    logger.warning(f"[Examiney][RoleRec] Ollama /api/chat: Empty response")
+                elif len(result) <= 100:
+                    logger.warning(f"[Examiney][RoleRec] Ollama /api/chat: Response too short ({len(result)} chars)")
+                elif result.startswith(("Answer Quality Assessment", "===", "1. Job Fit", "**1.", "- Job Fit")):
+                    logger.warning(f"[Examiney][RoleRec] Ollama /api/chat: Response echoes template. First 100 chars: {result[:100]}")
+                else:
+                    logger.info(f"[Examiney][RoleRec] ✓ Ollama /api/chat succeeded ({len(result)} chars)")
+                    return _clean_text_markdown(result)
+            else:
+                logger.warning(f"[Examiney][RoleRec] Ollama /api/chat HTTP {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        logger.warning(f"[Examiney][RoleRec] Ollama /api/chat failed: {type(e).__name__}: {str(e)[:100]}")
 
-    # Fall back to Ollama /api/generate
+    # Try Ollama /api/generate (alternative endpoint)
+    gen_payload = {
+        "model":  model,
+        "prompt": f"{system_msg}\n\n{prompt}",
+        "stream": False,
+        "options": {"temperature": 0.4, "num_predict": 2048},
+    }
     try:
-        gen_payload = {
-            "model":  model,
-            "prompt": f"{system_msg}\n\n{prompt}",
-            "stream": False,
-            "options": {"temperature": 0.4, "num_predict": 1024},
-        }
+        logger.debug(f"[Examiney][RoleRec] Trying Ollama /api/generate (url={ollama_url}) with model={model}")
         with httpx.Client(timeout=60.0) as client:
             resp = client.post(f"{ollama_url}/api/generate", json=gen_payload)
-            resp.raise_for_status()
-            result = resp.json()["response"].strip()
-            return _clean_text_markdown(result)
+            if resp.status_code == 200:
+                result = resp.json()["response"].strip()
+                # Validate response is meaningful and not echoing template
+                if not result:
+                    logger.warning(f"[Examiney][RoleRec] Ollama /api/generate: Empty response")
+                elif len(result) <= 100:
+                    logger.warning(f"[Examiney][RoleRec] Ollama /api/generate: Response too short ({len(result)} chars)")
+                elif result.startswith(("Answer Quality Assessment", "====", "1. Job Fit", "**1.", "- Job Fit")):
+                    logger.warning(f"[Examiney][RoleRec] Ollama /api/generate: Response echoes template. First 100 chars: {result[:100]}")
+                else:
+                    logger.info(f"[Examiney][RoleRec] ✓ Ollama /api/generate succeeded ({len(result)} chars)")
+                    return _clean_text_markdown(result)
+            else:
+                logger.warning(f"[Examiney][RoleRec] Ollama /api/generate HTTP {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
-        # Structured fallback when all LLMs fail
-        fit_label = "Recommended" if job_fit_score >= 70 else "Recommended with caution" if job_fit_score >= 50 else "Not recommended"
-        ocean_dict = {
-            "Openness": ocean.openness, "Conscientiousness": ocean.conscientiousness,
-            "Extraversion": ocean.extraversion, "Agreeableness": ocean.agreeableness,
-            "Neuroticism": ocean.neuroticism,
-        }
-        strongest = max(ocean_dict, key=ocean_dict.__getitem__)
-        weakest = min(ocean_dict, key=ocean_dict.__getitem__)
-        qa_summary_lines = []
-        if scores and script:
-            q_map = {q.id: q for q in script.questions}
-            for s in scores:
-                q_obj = q_map.get(s.question_id)
-                if not q_obj or not s.transcript.strip():
-                    continue
-                label = "Excellent" if s.combined_score >= 8 else "Good" if s.combined_score >= 6 else "Adequate" if s.combined_score >= 4 else "Poor"
-                qa_summary_lines.append(f"• {q_obj.question[:80]} — {label} ({s.combined_score:.1f}/10)")
-        qa_text = "\n".join(qa_summary_lines) if qa_summary_lines else "• No responses recorded."
-        return (
-            f"**Answer Quality Assessment:**\n{qa_text}\n\n"
-            f"**Personality & Fit Analysis:**\n"
-            f"• Strongest trait ({strongest}): Score {ocean_dict[strongest]:.1f}/100 — contributes positively to role performance.\n"
-            f"• Weakest trait ({weakest}): Score {ocean_dict[weakest]:.1f}/100 — may need development for this role.\n"
-            f"• Job Fit Score ({job_fit_score:.1f}/100): {fit_label} — "
-            f"{'strong alignment with role requirements.' if job_fit_score >= 65 else 'partial alignment; further assessment advised.' if job_fit_score >= 45 else 'insufficient alignment with role requirements.'}"
-        )
+        logger.warning(f"[Examiney][RoleRec] Ollama /api/generate error: {type(e).__name__}: {str(e)[:100]}")
+
+    # ── PRIORITY 3: Static structured fallback (only when all LLMs fail) ──────────────────────
+    logger.error(f"[Examiney][RoleRec] All LLM attempts failed (Gemini + Ollama). Using context-aware static fallback.")
+    
+    fit_label = "Recommended" if job_fit_score >= 70 else "Recommended with caution" if job_fit_score >= 50 else "Not recommended"
+    fit_summary = (
+        "Strong candidate with excellent alignment to role requirements. Recommend immediate onboarding."
+        if job_fit_score >= 70
+        else "Candidate meets core requirements. Some skill gaps identified; targeted mentoring recommended."
+        if job_fit_score >= 50
+        else "Candidate alignment is insufficient for this role. Consider other candidates."
+    )
+    
+    # Build Q&A summary from actual responses
+    qa_lines = []
+    if scores and script:
+        q_map = {q.id: q for q in script.questions}
+        for s in scores[:8]:  # Limit to 8 most recent
+            q_obj = q_map.get(s.question_id)
+            if not q_obj or not s.transcript.strip():
+                continue
+            quality = "Excellent" if s.combined_score >= 8 else "Good" if s.combined_score >= 6 else "Adequate" if s.combined_score >= 4 else "Poor"
+            qa_lines.append(f"• {q_obj.stage.title()}: {q_obj.question[:60]}... → {quality} ({s.combined_score:.1f}/10)")
+    
+    qa_text = "\n".join(qa_lines) if qa_lines else "• No interview responses available"
+    
+    # Build stage performance breakdown
+    stage_text_lines = []
+    for stage, avg in stage_averages.items():
+        level = "Excellent" if avg >= 8 else "Good" if avg >= 6 else "Adequate" if avg >= 4 else "Needs Improvement"
+        stage_text_lines.append(f"• {stage}: {avg:.1f}/10 ({level})")
+    stage_text = "\n".join(stage_text_lines) if stage_text_lines else "• No stage data"
+    
+    # Log static fallback success
+    recommendation_text = (
+        f"**Candidate Assessment**\n\n"
+        f"**Position:** {jd_snippet}\n"
+        f"**Overall Fit Score:** {job_fit_score:.1f}/100\n"
+        f"**Recommendation:** {fit_label}\n\n"
+        f"**Performance Breakdown:**\n{qa_text}\n\n"
+        f"**Stage Analysis:**\n{stage_text}\n\n"
+        f"**Key Strengths & Development Areas:**\n"
+        f"• Primary Strength: {strongest_trait} ({ocean_dict[strongest_trait]:.0f}/100) — "
+        f"{'Shows high comfort with novel situations and creative thinking.' if strongest_trait == 'Openness' else 'Demonstrates strong focus on task completion and quality.' if strongest_trait == 'Conscientiousness' else 'Excellent interpersonal and communication skills.' if strongest_trait == 'Extraversion' else 'Shows strong collaboration and empathy.' if strongest_trait == 'Agreeableness' else 'Generally maintains emotional stability and resilience.'}\n"
+        f"• Development Area: {weakest_trait} ({ocean_dict[weakest_trait]:.0f}/100) — "
+        f"{'May benefit from embracing new approaches and perspectives.' if weakest_trait == 'Openness' else 'Could strengthen attention to detail and planning.' if weakest_trait == 'Conscientiousness' else 'Opportunity to expand networking and team engagement.' if weakest_trait == 'Extraversion' else 'Consider developing assertiveness and boundary-setting skills.' if weakest_trait == 'Agreeableness' else 'Focus on stress management and emotional regulation techniques.'}\n\n"
+        f"**Hiring Summary:**\n{fit_summary}"
+    )
+    logger.info(f"[Examiney][RoleRec] ✓ Static fallback succeeded ({len(recommendation_text)} chars) - fit_score={job_fit_score:.1f}, strength={strongest_trait}, weakness={weakest_trait}")
+    return recommendation_text
+    
+
 
 
 # ── Success prediction ────────────────────────────────────────────────────────
@@ -845,6 +971,36 @@ def build_ocean_report(
         agreeableness=_safe_agg(all_signals.agreeableness),
         neuroticism=_safe_agg(all_signals.neuroticism),
     )
+
+    # ── Trained-model override (ChaLearn-calibrated) ──────────────────────────
+    # If models/ocean_regressor.pkl exists, replace the rule-based OCEAN scores
+    # with predictions from the MLP trained on ChaLearn human-rated data.
+    _MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "ocean_regressor.pkl"
+    if _MODEL_PATH.exists():
+        try:
+            import pickle as _pickle
+            from sentence_transformers import SentenceTransformer as _ST
+            with open(_MODEL_PATH, "rb") as _f:
+                _bundle = _pickle.load(_f)
+            _encoder = _ST(_bundle.get("encoder", "all-mpnet-base-v2"))
+            _combined_text = " ".join(s.transcript for s in scores if s.transcript.strip())
+            if _combined_text.strip():
+                _X = _encoder.encode([_combined_text], normalize_embeddings=True)
+                _pred = _bundle["model"].predict(_X)[0]  # shape (5,)
+                _trait_order = _bundle.get("traits", ["openness", "conscientiousness",
+                                                       "extraversion", "agreeableness", "neuroticism"])
+                _pred_map = {t: float(v) * 100 for t, v in zip(_trait_order, _pred)}
+                ocean = OceanScores(
+                    openness=round(_pred_map.get("openness", ocean.openness), 1),
+                    conscientiousness=round(_pred_map.get("conscientiousness", ocean.conscientiousness), 1),
+                    extraversion=round(_pred_map.get("extraversion", ocean.extraversion), 1),
+                    agreeableness=round(_pred_map.get("agreeableness", ocean.agreeableness), 1),
+                    neuroticism=round(_pred_map.get("neuroticism", ocean.neuroticism), 1),
+                )
+                logger.info("[ocean_mapper] scores provided by trained ChaLearn model")
+        except Exception as _e:
+            logger.warning(f"[ocean_mapper] trained model failed, using rule-based scores: {_e}")
+    # ── end trained-model override ─────────────────────────────────────────────
 
     trait_interpretations = {
         trait: _interpret(trait, getattr(ocean, trait))

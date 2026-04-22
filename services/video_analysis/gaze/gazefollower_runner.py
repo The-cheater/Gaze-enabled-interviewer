@@ -30,12 +30,22 @@ except Exception as _gf_err:
         "Install GazeFollower with: pip install gazefollower"
     )
 
-# ── Try importing MediaPipe (used as fallback) ────────────────────────────────
+# ── Try importing MediaPipe Tasks API (used as fallback) ─────────────────────
 _MP_AVAILABLE = False
+_MP_MODEL_PATH: Optional[str] = None
 try:
-    import mediapipe as _mp  # noqa: F401
-    _MP_AVAILABLE = True
-    print("[Examiney][GazeFollower] MediaPipe available for fallback gaze estimation")
+    from mediapipe.tasks import python as _mp_tasks          # noqa: F401
+    from mediapipe.tasks.python import vision as _mp_vision  # noqa: F401
+    import os as _os
+    _candidate = _os.path.abspath(
+        _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "models", "face_landmarker.task")
+    )
+    if _os.path.exists(_candidate):
+        _MP_AVAILABLE = True
+        _MP_MODEL_PATH = _candidate
+        print(f"[Examiney][GazeFollower] MediaPipe Tasks API available (model: {_candidate})")
+    else:
+        print(f"[Examiney][GazeFollower] MediaPipe installed but model missing: {_candidate}")
 except Exception:
     print("[Examiney][GazeFollower] MediaPipe not available — install with: pip install mediapipe")
 
@@ -140,24 +150,21 @@ def _mediapipe_gaze_from_frames(
     frames: List[Any],
     calibration_data: Optional[Dict] = None,
 ) -> List[Tuple[float, float]]:
-    """Estimate gaze using MediaPipe FaceMesh iris landmarks (468 & 473).
+    """Estimate gaze using MediaPipe Tasks FaceLandmarker iris landmarks (468 & 473).
 
-    Improvements vs. first version:
-    - static_image_mode=False: processes frames sequentially, enabling MediaPipe
-      tracking between frames (much faster, fewer false negatives).
-    - Blink exclusion: frames where the eye aspect ratio falls below a threshold
-      (eyelid occludes iris) are skipped to avoid corrupt gaze estimates.
-    - Kalman filter smoothing: 1D position Kalman applied to x and y independently
-      to suppress high-frequency jitter while preserving true gaze shifts.
+    Uses the Tasks API (mediapipe 0.10+) which exposes 478 landmarks including
+    iris centres when the face_landmarker.task model is used.
 
+    Applies blink exclusion via eye aspect ratio and Kalman smoothing.
     Applies the candidate's affine calibration transform when available.
     Returns a list of (x, y) tuples in [0, 1] screen coordinates.
     """
-    if not _MP_AVAILABLE or not frames:
+    if not _MP_AVAILABLE or not frames or not _MP_MODEL_PATH:
         return []
 
     import cv2
-    import mediapipe as mp
+    from mediapipe.tasks import python as mp_tasks
+    from mediapipe.tasks.python import vision as mp_vision
 
     _apply_transform = None
     transform_matrix = (calibration_data or {}).get("transform_matrix")
@@ -168,51 +175,53 @@ def _mediapipe_gaze_from_frames(
         except Exception:
             pass
 
-    mp_face_mesh = mp.solutions.face_mesh
     raw_points: List[Tuple[float, float]] = []
     failed = 0
     blinks = 0
 
-    # Landmark indices for eye aspect ratio (EAR) blink detection
-    # Left eye: 33, 159, 145, 133; Right eye: 362, 386, 374, 263
-    _LEFT_TOP, _LEFT_BOT   = 159, 145
-    _RIGHT_TOP, _RIGHT_BOT = 386, 374
-    _LEFT_INNER, _LEFT_OUTER   = 133, 33
+    # EAR landmark indices (same as before)
+    _LEFT_TOP,  _LEFT_BOT   = 159, 145
+    _RIGHT_TOP, _RIGHT_BOT  = 386, 374
+    _LEFT_INNER,  _LEFT_OUTER  = 133, 33
     _RIGHT_INNER, _RIGHT_OUTER = 263, 362
-    _EAR_THRESHOLD = 0.18   # below this → blink / squint → unreliable iris
+    _EAR_THRESHOLD = 0.18
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=False,          # tracking mode: faster, more stable
-        max_num_faces=1,
-        refine_landmarks=True,            # enables iris landmarks 468-477
-        min_detection_confidence=0.5,
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=_MP_MODEL_PATH),
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_score=0.5,
         min_tracking_confidence=0.5,
-    ) as face_mesh:
+        running_mode=mp_vision.RunningMode.IMAGE,
+    )
+
+    with mp_vision.FaceLandmarker.create_from_options(options) as landmarker:
         for frame in frames:
             try:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = face_mesh.process(rgb)
-                if not result.multi_face_landmarks:
+                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_img = mp_vision.Image(image_format=mp_vision.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect(mp_img)
+
+                if not result.face_landmarks:
                     failed += 1
                     continue
 
-                lm = result.multi_face_landmarks[0].landmark
+                lm = result.face_landmarks[0]   # list of NormalizedLandmark
                 if len(lm) <= 473:
                     failed += 1
                     continue
 
-                # ── Blink detection via eye aspect ratio ──────────────────
-                def _dist(a, b) -> float:
+                # ── Blink detection via EAR ───────────────────────────────
+                def _dist(a: int, b: int) -> float:
                     return ((lm[a].x - lm[b].x) ** 2 + (lm[a].y - lm[b].y) ** 2) ** 0.5
 
-                left_ear  = _dist(_LEFT_TOP, _LEFT_BOT)   / (_dist(_LEFT_INNER, _LEFT_OUTER) + 1e-9)
+                left_ear  = _dist(_LEFT_TOP,  _LEFT_BOT)  / (_dist(_LEFT_INNER,  _LEFT_OUTER)  + 1e-9)
                 right_ear = _dist(_RIGHT_TOP, _RIGHT_BOT) / (_dist(_RIGHT_INNER, _RIGHT_OUTER) + 1e-9)
-                ear = (left_ear + right_ear) / 2.0
-                if ear < _EAR_THRESHOLD:
+                if (left_ear + right_ear) / 2.0 < _EAR_THRESHOLD:
                     blinks += 1
-                    continue   # eye closed or squinting — skip frame
+                    continue
 
-                # ── Iris centre (average of left 468 and right 473) ───────
+                # ── Iris centre ───────────────────────────────────────────
                 lx = (lm[468].x + lm[473].x) / 2.0
                 ly = (lm[468].y + lm[473].y) / 2.0
                 raw = (lx, ly)
@@ -220,9 +229,10 @@ def _mediapipe_gaze_from_frames(
                 if _apply_transform is not None and transform_matrix:
                     try:
                         mapped = _apply_transform(raw, transform_matrix)
-                        gx = max(0.0, min(1.0, float(mapped[0])))
-                        gy = max(0.0, min(1.0, float(mapped[1])))
-                        raw_points.append((gx, gy))
+                        raw_points.append((
+                            max(0.0, min(1.0, float(mapped[0]))),
+                            max(0.0, min(1.0, float(mapped[1]))),
+                        ))
                     except Exception:
                         raw_points.append((max(0.0, min(1.0, lx)), max(0.0, min(1.0, ly))))
                 else:
@@ -231,9 +241,7 @@ def _mediapipe_gaze_from_frames(
             except Exception:
                 failed += 1
 
-    # ── Kalman filter smoothing ───────────────────────────────────────────────
     gaze_points = _kalman_smooth(raw_points)
-
     print(
         f"[Examiney][MediaPipeGaze] {len(gaze_points)} gaze points, "
         f"{blinks} blinks excluded, {failed} frames failed"
